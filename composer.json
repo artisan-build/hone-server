@@ -1,19 +1,16 @@
 {
     "name": "artisan-build/hone-server",
     "description": "The receive/store/serve side of Hone: ingest endpoint, Postgres storage, rollups, prune, and the read-only MCP server. Consumed by the Hone app.",
-    "keywords": ["hone", "telemetry", "nightwatch", "laravel", "mcp", "observability"],
+    "keywords": [
+        "hone",
+        "telemetry",
+        "nightwatch",
+        "laravel",
+        "mcp",
+        "observability"
+    ],
     "license": "MIT",
     "type": "library",
-    "version": "1.0.0",
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../hone-contracts",
-            "options": {
-                "symlink": true
-            }
-        }
-    ],
     "require": {
         "php": "^8.3",
         "artisan-build/built-for-cloud": "^0.3",
