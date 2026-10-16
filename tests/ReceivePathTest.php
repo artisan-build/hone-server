@@ -233,8 +233,19 @@ it('persists large telemetry batches in bounded bulk inserts', function (): void
         ->and(RawEvent::query()->where('normalized_key', 'select 1201')->value('duration_ms'))->toBe(1201.0);
 });
 
-it('falls back around a rejected row and puts the root exception in the log message', function (): void {
+it('persists a batch containing an over-length query key in a single chunk insert', function (): void {
     Log::spy();
+    $longSql = 'select * from orders where reference in ('.implode(', ', array_fill(0, 40, '?')).') and tenant = '.str_repeat('x', 200);
+
+    expect(mb_strlen($longSql))->toBeGreaterThan(255);
+
+    $rawEventInserts = 0;
+
+    DB::connection('hone')->listen(function (QueryExecuted $query) use (&$rawEventInserts): void {
+        if (str_starts_with(strtolower($query->sql), 'insert into "raw_events"')) {
+            $rawEventInserts++;
+        }
+    });
 
     (new ProcessTelemetryBatch(
         app: 'checkout',
@@ -242,19 +253,84 @@ it('falls back around a rejected row and puts the root exception in the log mess
         sentAt: '2026-06-09T12:00:00+00:00',
         records: [
             ['t' => 'query', 'sql' => 'select good_one'],
-            ['t' => 'query', 'sql' => str_repeat('x', 300)],
+            ['t' => 'query', 'sql' => $longSql],
             ['t' => 'query', 'sql' => 'select good_two'],
         ],
     ))->handle(resolve(AsnLookup::class));
 
+    expect(RawEvent::query()->count())->toBe(3)
+        ->and($rawEventInserts)->toBe(1)
+        ->and(RawEvent::query()->orderBy('id')->pluck('normalized_key')->all())
+        ->toBe(['select good_one', Normalizer::keyFor('query', ['sql' => $longSql]), 'select good_two']);
+
+    Log::shouldNotHaveReceived('warning');
+});
+
+it('falls back around a rejected row and logs the record type and cause without row values', function (): void {
+    Log::spy();
+    DB::connection('hone')->statement("ALTER TABLE raw_events ADD CONSTRAINT raw_events_reject_queries CHECK (record_type <> 'query')");
+
+    (new ProcessTelemetryBatch(
+        app: 'checkout',
+        deploy: null,
+        sentAt: '2026-06-09T12:00:00+00:00',
+        records: [
+            ['t' => 'request', 'method' => 'GET', 'route' => '/one'],
+            ['t' => 'query', 'sql' => 'select secret_value from users'],
+            ['t' => 'request', 'method' => 'GET', 'route' => '/two'],
+        ],
+    ))->handle(resolve(AsnLookup::class));
+
     expect(RawEvent::query()->orderBy('id')->pluck('normalized_key')->all())
-        ->toBe(['select good_one', 'select good_two']);
+        ->toBe(['GET /one', 'GET /two']);
 
     Log::shouldHaveReceived('warning')
         ->once()
-        ->withArgs(fn (string $message, array $context): bool => str_contains($message, 'Failed to persist Hone telemetry record (query); PDOException:')
-            && str_contains($message, 'value too long for type character varying(255)')
+        ->withArgs(fn (string $message, array $context): bool => str_contains($message, 'Failed to persist Hone telemetry record (query); the telemetry database rejected the row; PDOException SQLSTATE[23514]')
+            && ! str_contains($message, 'raw_events_reject_queries')
+            && ! str_contains($message, 'secret_value')
             && $context['record_type'] === 'query');
+});
+
+it('does not log database-bound row values that Postgres puts in its primary error line', function (): void {
+    Log::spy();
+
+    (new ProcessTelemetryBatch(
+        app: 'checkout',
+        deploy: null,
+        sentAt: '2026-06-09T12:00:00+00:00',
+        records: [
+            ['t' => 'query', 'sql' => 'select 1', 'timestamp' => 10000000000000000],
+        ],
+    ))->handle(resolve(AsnLookup::class));
+
+    expect(RawEvent::query()->count())->toBe(0);
+
+    Log::shouldHaveReceived('warning')
+        ->once()
+        ->withArgs(fn (string $message, array $context): bool => str_contains($message, 'Failed to persist Hone telemetry record (query)')
+            && str_contains($message, 'SQLSTATE[22008]')
+            && ! str_contains($message, '318857-05-20 17:46:40')
+            && $context['record_type'] === 'query');
+});
+
+it('logs unrecognized client record types as custom', function (): void {
+    Log::spy();
+
+    (new ProcessTelemetryBatch(
+        app: 'checkout',
+        deploy: null,
+        sentAt: '2026-06-09T12:00:00+00:00',
+        records: [
+            ['t' => str_repeat('custom-type', 30)],
+        ],
+    ))->handle(resolve(AsnLookup::class));
+
+    Log::shouldHaveReceived('warning')
+        ->once()
+        ->withArgs(fn (string $message, array $context): bool => str_contains($message, 'Failed to persist Hone telemetry record (custom)')
+            && ! str_contains($message, 'custom-type')
+            && $context['record_type'] === 'custom');
 });
 
 it('processes telemetry jobs serialized before loss counters were added', function (): void {
@@ -600,6 +676,77 @@ it('normalizes raw Nightwatch record type values', function (string $recordType,
     'cache store and type' => ['cache-event', ['store' => 'redis', 'type' => 'hit'], 'redis:hit'],
     'request by route path' => ['request', ['method' => 'GET', 'route_path' => '/posts/{post}'], 'GET /posts/{post}'],
     'request without a matched route keeps the method' => ['request', ['method' => 'POST', 'route_path' => ''], 'POST'],
+]);
+
+it('leaves keys at or under 255 characters byte-identical', function (): void {
+    $exactLimit = 'select '.str_repeat('a', 248);
+
+    expect(mb_strlen($exactLimit))->toBe(255)
+        ->and(Normalizer::keyFor('query', ['sql' => $exactLimit]))->toBe($exactLimit)
+        ->and(Normalizer::keyFor('query', ['sql' => 'select 1']))->toBe('select 1');
+});
+
+it('bounds over-length keys deterministically without colliding on a shared prefix', function (): void {
+    $sharedPrefix = 'select * from orders where '.str_repeat('a', 240);
+    $first = Normalizer::keyFor('query', ['sql' => $sharedPrefix.' and status = 1']);
+    $second = Normalizer::keyFor('query', ['sql' => $sharedPrefix.' and status = 2']);
+
+    expect(mb_strlen($first))->toBe(255)
+        ->and(mb_strlen($second))->toBe(255)
+        ->and($first)->not->toBe($second)
+        ->and($first)->toStartWith('select * from orders where ')
+        ->and(Normalizer::keyFor('query', ['sql' => $sharedPrefix.' and status = 1']))->toBe($first);
+});
+
+it('re-keys a short key shaped like the hashed form so it cannot collide with a long key', function (): void {
+    $longSql = 'select 1 -- '.str_repeat('x', 300);
+    $storedKey = Normalizer::keyFor('query', ['sql' => $longSql]);
+
+    // A client whose literal 255-char SQL equals the stored hashed form of some
+    // long key lands in the reserved namespace and is re-keyed, so the two
+    // inputs keep distinct identities.
+    $rekeyed = Normalizer::keyFor('query', ['sql' => $storedKey]);
+
+    expect(mb_strlen($storedKey))->toBe(255)
+        ->and($rekeyed)->not->toBe($storedKey)
+        ->and(mb_strlen($rekeyed))->toBe(255)
+        ->and(Normalizer::keyFor('query', ['sql' => $storedKey]))->toBe($rekeyed);
+});
+
+it('keeps a long SQL key distinct from an identical-looking short SQL key through to aggregates', function (): void {
+    $longSql = 'select 1 -- '.str_repeat('x', 300);
+    $shortSql = Normalizer::keyFor('query', ['sql' => $longSql]);
+
+    (new ProcessTelemetryBatch(
+        app: 'checkout',
+        deploy: null,
+        sentAt: '2026-06-09T12:00:00+00:00',
+        records: [
+            ['t' => 'query', 'sql' => $longSql],
+            ['t' => 'query', 'sql' => $shortSql],
+        ],
+    ))->handle(resolve(AsnLookup::class));
+
+    expect(RawEvent::query()->count())->toBe(2)
+        ->and(RawEvent::query()->distinct('normalized_key')->count())->toBe(2);
+});
+
+it('bounds every record type key to 255 characters', function (string $recordType, array $record): void {
+    expect(mb_strlen(Normalizer::keyFor($recordType, $record)))->toBeLessThanOrEqual(255);
+})->with([
+    'request' => ['request', ['method' => 'GET', 'route' => '/'.str_repeat('segment/', 60)]],
+    'query' => ['query', ['sql' => str_repeat('select 1 union ', 40)]],
+    'queued job' => ['queued-job', ['name' => str_repeat('App\\Jobs\\VeryLongJobName', 20)]],
+    'job attempt' => ['job-attempt', ['name' => str_repeat('App\\Jobs\\VeryLongJobName', 20)]],
+    'command' => ['command', ['name' => str_repeat('reports:build:', 30)]],
+    'scheduled task' => ['scheduled-task', ['name' => str_repeat('schedule:run:', 30)]],
+    'exception' => ['exception', ['class' => str_repeat('App\\Exceptions\\Long', 10), 'file' => str_repeat('/var/www/app/', 20), 'line' => 42]],
+    'outgoing request' => ['outgoing-request', ['method' => 'GET', 'host' => str_repeat('sub.', 80).'example.com']],
+    'log' => ['log', ['level' => str_repeat('emergency', 40)]],
+    'user' => ['user', ['id' => str_repeat('1234567890', 30)]],
+    'cache event' => ['cache-event', ['store' => str_repeat('redis', 40), 'type' => str_repeat('hit', 40)]],
+    'unknown record type' => [str_repeat('custom-type', 30), []],
+    'multibyte key' => ['query', ['sql' => str_repeat('sélect Ω ', 60)]],
 ]);
 
 it('persists after response on sync queues using the token app instead of envelope app', function (): void {
